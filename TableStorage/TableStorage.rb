@@ -5,8 +5,7 @@ require 'Net/HTTP'
 require 'date'
 require 'SecureRandom'
 require 'builder'
-require 'rexml/document'
-require 'rexml/streamlistener'
+require 'libxml'
 
 #module Config
   @Account
@@ -109,7 +108,7 @@ def authorizationToken(authKey, account, date, contentType, method, resource)
 end
 
 class EmployeesXMLListener
-  include REXML::StreamListener
+  include LibXML::XML::SaxParser::Callbacks
   attr_accessor :Employees
   
   def initialize
@@ -118,21 +117,18 @@ class EmployeesXMLListener
     @value = ""
   end
 
-  def tag_start(name, attr_hash)
+  def on_start_element(name, attr_hash)
     if name == "entry"
       @Employee = Employee.new(nil, true)
       @value = ""
     end
   end
 
-  def text( str )
+  def on_characters( str )
     @value += str
   end
 
-  # Treat CDATA sections just like text
-  alias_method :cdata, :text
-
-  def tag_end( name )
+  def on_end_element( name )
     if name == "entry"
       @Employees << @Employee
       @Employee = nil
@@ -142,7 +138,7 @@ class EmployeesXMLListener
       @value = @value.strip
       case name
       when "d:RowKey"
-        @Employee.RowKey = @value
+        @Employee.RowKey = @value.to_i
       when "d:Position"
         @Employee.Position = @value
       when "d:Timestamp"
@@ -152,7 +148,7 @@ class EmployeesXMLListener
       when "d:Address"
         @Employee.Address = @value
       when "d:Salary"
-        @Employee.Salary = @value
+        @Employee.Salary = @value.to_i
       when "d:PartitionKey"
         a = @value.split("_PLZ")
         @Employee.Country = a[0]
@@ -180,10 +176,81 @@ class Employee
   
   def self.employeesFromResponse(response)
     listener = EmployeesXMLListener.new
-    
-    REXML::Document.parse_stream(response.body, listener)
+        
+    parser = LibXML::XML::SaxParser.string(response.body)
+    parser.callbacks = listener
+    parser.parse
     
     listener.Employees
+  end
+  
+  def self.generateEntries(country, count)
+    raise "Count must be greater zero" unless count > 0
+    raise "Unkown country" unless Countries.include?(country)
+  
+    (1..count).each do |n|
+      employee = Employee.new(country)
+      puts "##{n}: Upload #{employee}"
+      Table.sendPostRequest(employee.to_xml)
+    end
+  end
+  
+  def self.getEntries(country, minPLZ = 0, maxPLZ=99999, extraFilter=nil)
+    raise "Unkown country" unless Countries.include?(country) or country.nil?
+  
+    continuationNextTableName = nil
+    continuationNextPartitionKey = nil
+    continuationNextRowKey = nil
+  
+    employees = []
+  
+    begin
+      args = {}
+    
+      args['NextTableName'] = continuationNextTableName
+      args['NextPartitionKey'] = continuationNextPartitionKey
+      args['NextRowKey'] = continuationNextRowKey
+    
+      filters = []
+    
+      filters << "(PartitionKey ge '%s_PLZ%05d')" % [country, minPLZ] << "(PartitionKey le '%s_PLZ%05d')" % [country, maxPLZ] unless country.nil?    
+      filters << extraFilter unless extraFilter.nil?
+        
+      args['$filter'] = filters.join(" and ")
+          
+      puts "Fetch..."
+      response = Table.sendGetRequest(args)
+    
+      continuationNextTableName = response['x-ms-continuation-NextTableName']
+      continuationNextPartitionKey = response['x-ms-continuation-NextPartitionKey']
+      continuationNextRowKey = response['x-ms-continuation-NextRowKey']
+      puts "Process.."
+      employees += Employee.employeesFromResponse(response)
+    end while not (continuationNextTableName.nil? and continuationNextPartitionKey.nil? and continuationNextRowKey.nil?)
+  
+    employees
+  end
+  
+  def self.average_salary(country, position)
+    raise "Unkown country" unless Countries.include?(country) or country.nil?
+    raise "Unkown position" unless Positions.include?(position) or position.nil?
+    
+    position ||= "Developer"
+    
+    if country.nil?
+      Countries.each do |c|
+        average_salary(c)
+      end
+    else
+      entries = getEntries(country, 0, 99999, "(Position eq '#{position}')")
+      avg = 0
+      entries.each do |entry|
+        avg += entry.Salary
+      end
+  
+      avg /= entries.length
+      puts "Avg #{avg}"
+    end
   end
   
   def self.nextIndex(country)
@@ -258,50 +325,8 @@ Table = AzureTable.new(@Key, @Account, @Table)
 def printUsage
   puts "TableStorage.rb gen country count"
   puts "                read [country]"
-end
-
-def generateEntries(country, count)
-  raise "Count must be greater zero" unless count > 0
-  raise "Unkown country" unless Employee::Countries.include?(country)
-  
-  (1..count).each do |n|
-    employee = Employee.new(country)
-    puts "##{n}: Upload #{employee}"
-    Table.sendPostRequest(employee.to_xml)
-  end
-end
-
-def getEntries(country)
-  raise "Unkown country" unless Employee::Countries.include?(country) or country.nil?
-  
-  continuationNextTableName = nil
-  continuationNextPartitionKey = nil
-  continuationNextRowKey = nil
-  
-  employees = []
-  
-  begin
-    args = {}
-    
-    args['NextTableName'] ||= continuationNextTableName
-    args['NextPartitionKey'] ||= continuationNextPartitionKey
-    args['NextRowKey'] ||= continuationNextRowKey
-    
-    if not country.nil?
-      args['$filter'] = "(PartitionKey ge '#{country}_PLZ00000') and (PartitionKey le '#{country}_PLZ99999')"
-    end
-    
-    puts "Fetch..."
-    response = Table.sendGetRequest(args)
-    
-    continuationNextTableName = response['x-ms-continuation-NextTableName']
-    continuationNextPartitionKey = response['x-ms-continuation-NextPartitionKey']
-    continuationNextRowKey = response['x-ms-continuation-NextRowKey']
-    
-    employees += Employee.employeesFromResponse(response)
-  end while not (continuationNextTableName.nil? and continuationNextPartitionKey.nil? and continuationNextRowKey.nil?)
-  
-  puts "Found #{employees.length}"
+  puts "                avg_salary [country] [Developer|Manager|Tester]"
+  puts "                count_manager [country]"
 end
 
 if ARGV.length < 1
@@ -315,8 +340,12 @@ when "gen"
     printUsage
     exit! 1
   end
-  generateEntries(ARGV[1], ARGV[2].to_i)
+  Employee.generateEntries(ARGV[1], ARGV[2].to_i)
 when "read"
   puts "read something"
-  getEntries(ARGV[1])
+  puts Employee.getEntries(ARGV[1])
+when "avg_salary"
+  Employee.average_salary(ARGV[1], ARGV[2])
+when "count_manager"
+  puts "Got #{Employee.getEntries(ARGV[1], 30000, 80000, "(Position eq 'Manager')").length} entries"
 end
