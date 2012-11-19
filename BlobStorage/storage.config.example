@@ -1,0 +1,15 @@
+
+#
+# The account name of your storage account
+#
+account "your table storage account"
+
+#
+# The acceskey to authenticate with the storage
+#
+key "your access key"
+
+#
+# The container to operate on. MUST exist.
+#
+container "you container name"

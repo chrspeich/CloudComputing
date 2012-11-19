@@ -239,7 +239,8 @@ class Employee
     
     if country.nil?
       Countries.each do |c|
-        average_salary(c)
+        puts c
+        average_salary(c, nil)
       end
     else
       entries = getEntries(country, 0, 99999, "(Position eq '#{position}')")
